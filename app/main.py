@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import google.generativeai as genai
 from typing import List
 import os
 import sys
@@ -9,30 +8,45 @@ from pathlib import Path
 from dotenv import load_dotenv
 import traceback
 
-# Add parent directory to Python path to import book_data
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# -----------------------------
+# 1️⃣ Load environment variables
+# -----------------------------
+load_dotenv()  # For local development only
+
+# -----------------------------
+# 2️⃣ Setup Python path for book_data
+# -----------------------------
+# backend_root should contain book_data.py and app/
+backend_root = Path(__file__).parent.parent.resolve()
+sys.path.insert(0, str(backend_root))
 
 try:
     from book_data import get_all_chapters
     print("✅ Successfully imported book_data")
-except Exception as e:
+except ModuleNotFoundError as e:
     print(f"❌ Error importing book_data: {e}")
+    print("Make sure book_data.py is in the backend folder (same level as app/)")
     raise
 
-load_dotenv()
-
+# -----------------------------
+# 3️⃣ Configure FastAPI
+# -----------------------------
 app = FastAPI()
 
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],  # Add frontend URLs
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configure Gemini
+# -----------------------------
+# 4️⃣ Configure Gemini API
+# -----------------------------
+import google.generativeai as genai
+
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
     print("⚠️  WARNING: GEMINI_API_KEY not found in environment!")
@@ -40,6 +54,9 @@ else:
     print(f"✅ Gemini API Key loaded: {api_key[:10]}...")
     genai.configure(api_key=api_key)
 
+# -----------------------------
+# 5️⃣ Define Models
+# -----------------------------
 class ChatRequest(BaseModel):
     message: str
 
@@ -48,17 +65,16 @@ class ChatResponse(BaseModel):
     source: str
     chapters: List[int] = []
 
-
+# -----------------------------
+# 6️⃣ Utility: Search book content
+# -----------------------------
 def search_book_content(query: str, top_k: int = 3):
     try:
         chapters_data = get_all_chapters()
-        print(f"📚 Searching {len(chapters_data)} chapters for: {query}")
-        
         query_lower = query.lower()
         query_words = [word for word in query_lower.split() if len(word) > 2]
         
         results = []
-        
         for chapter in chapters_data:
             title_lower = chapter['title'].lower()
             content_lower = chapter['content'].lower()
@@ -69,16 +85,11 @@ def search_book_content(query: str, top_k: int = 3):
                 score += content_lower.count(word)
             
             if score > 0:
-                results.append({
-                    'chapter': chapter,
-                    'score': score
-                })
+                results.append({'chapter': chapter, 'score': score})
         
         results.sort(key=lambda x: x['score'], reverse=True)
         top_results = results[:top_k]
         total_score = sum(r['score'] for r in top_results)
-        
-        print(f"🔍 Found {len(results)} relevant chapters, score: {total_score}")
         
         return [r['chapter'] for r in top_results], total_score
     except Exception as e:
@@ -86,29 +97,24 @@ def search_book_content(query: str, top_k: int = 3):
         traceback.print_exc()
         raise
 
-
+# -----------------------------
+# 7️⃣ Chat Endpoint
+# -----------------------------
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     try:
-        print(f"\n💬 Received message: {request.message}")
-        
         relevant_chapters, relevance_score = search_book_content(request.message, top_k=3)
-        
         RELEVANCE_THRESHOLD = 3
-        
-        print(f"📊 Relevance score: {relevance_score}, Threshold: {RELEVANCE_THRESHOLD}")
-        
+
         if not api_key:
             raise HTTPException(
-                status_code=500, 
-                detail="Gemini API key not configured. Check your .env file."
+                status_code=500,
+                detail="Gemini API key not configured. Check your environment variables."
             )
-        
+
         model = genai.GenerativeModel('gemini-2.5-flash')
-        
+
         if relevance_score >= RELEVANCE_THRESHOLD and relevant_chapters:
-            print(f"✅ Answering from book chapters: {[ch['id'] for ch in relevant_chapters]}")
-            
             context = "\n\n".join([
                 f"=== CHAPTER {ch['id']}: {ch['title']} ===\n"
                 f"Difficulty: {ch['difficulty']} | Reading Time: {ch['readingTime']} | Pages: {ch['pages']}\n\n"
@@ -134,19 +140,14 @@ async def chat(request: ChatRequest):
 
 💡 YOUR ANSWER (with citations):"""
 
-            print("🤖 Calling Gemini API (from book)...")
             response = model.generate_content(prompt)
-            print(f"✅ Got response: {len(response.text)} characters")
             
             return ChatResponse(
                 response=response.text,
                 source="book",
                 chapters=chapter_numbers
             )
-        
         else:
-            print("ℹ️  Answering from general knowledge")
-            
             prompt = f"""You are helping someone with a robotics question. This topic isn't covered in their current book chapters.
 
 ⚡ INSTRUCTIONS:
@@ -159,9 +160,7 @@ async def chat(request: ChatRequest):
 
 💡 SHORT ANSWER:"""
 
-            print("🤖 Calling Gemini API (general knowledge)...")
             response = model.generate_content(prompt)
-            print(f"✅ Got response: {len(response.text)} characters")
             
             answer_text = response.text
             if len(answer_text) > 200:
@@ -174,57 +173,27 @@ async def chat(request: ChatRequest):
             )
     
     except Exception as e:
-        print(f"\n❌ ERROR in /chat endpoint:")
-        print(f"   Error type: {type(e).__name__}")
-        print(f"   Error message: {str(e)}")
         traceback.print_exc()
-        
         raise HTTPException(
             status_code=500,
             detail=f"Internal server error: {str(e)}"
         )
 
-
+# -----------------------------
+# 8️⃣ Health & Stats Endpoints
+# -----------------------------
 @app.get("/")
 async def root():
-    return {
-        "message": "Physical AI Book Chatbot - Hybrid Search System",
-        "version": "2.0 (Debug Mode)",
-        "features": {
-            "book_search": "Searches 37 chapters with keyword matching",
-            "fallback": "Uses general knowledge for topics not in book",
-            "citations": "Provides chapter numbers and page references",
-            "smart_routing": "Automatically decides book vs general knowledge"
-        },
-        "endpoints": {
-            "/chat": "POST - Send message and get response",
-            "/health": "GET - Check API health",
-            "/stats": "GET - Get book statistics"
-        }
-    }
-
+    return {"message": "Physical AI Book Chatbot - Hybrid Search System", "version": "2.0"}
 
 @app.get("/health")
 async def health():
     try:
         chapters_count = len(get_all_chapters())
         api_configured = bool(os.getenv("GEMINI_API_KEY"))
-        
-        return {
-            "status": "healthy",
-            "book_chapters_loaded": chapters_count,
-            "gemini_configured": api_configured,
-            "debug_info": {
-                "api_key_present": api_configured,
-                "api_key_length": len(os.getenv("GEMINI_API_KEY", "")) if api_configured else 0
-            }
-        }
+        return {"status": "healthy", "book_chapters_loaded": chapters_count, "gemini_configured": api_configured}
     except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e)
-        }
-
+        return {"status": "error", "error": str(e)}
 
 @app.get("/stats")
 async def stats():
@@ -236,37 +205,18 @@ async def stats():
                 "Student": len([ch for ch in chapters if ch['difficulty'] == 'Student']),
                 "Professional": len([ch for ch in chapters if ch['difficulty'] == 'Professional']),
                 "Researcher": len([ch for ch in chapters if ch['difficulty'] == 'Researcher'])
-            },
-            "chapters": [
-                {
-                    "id": ch['id'],
-                    "title": ch['title'],
-                    "difficulty": ch['difficulty'],
-                    "readingTime": ch['readingTime']
-                }
-                for ch in chapters
-            ]
+            }
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
+# -----------------------------
+# 9️⃣ Run Locally
+# -----------------------------
 if __name__ == "__main__":
     import uvicorn
-    print("\n" + "="*50)
-    print("🚀 Starting Hybrid Chatbot Backend (DEBUG MODE)")
-    print("="*50)
-    print("📚 Loading book chapters...")
-    try:
-        chapter_count = len(get_all_chapters())
-        print(f"✅ Loaded {chapter_count} chapters")
-    except Exception as e:
-        print(f"❌ Error loading chapters: {e}")
-    
-    print(f"🔑 API Key configured: {bool(os.getenv('GEMINI_API_KEY'))}")
-    print("="*50 + "\n")
-    
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+
 
 
 
